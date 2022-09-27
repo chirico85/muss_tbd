@@ -57,9 +57,11 @@ def fairseq_preprocess(dataset, dict_path=None, source_lang='complex', target_la
             testpref = str(get_data_filepath(dataset, 'test', 'dummy')).replace('.dummy', '')
             args = f'''
                 --source-lang {source_lang} --target-lang {target_lang} --trainpref {trainpref} --validpref {validpref} --testpref {testpref}
-                --destdir {preprocessed_dir} --bpe sentencepiece
+                --destdir {preprocessed_dir} 
                 --joined-dictionary --workers 32
             '''
+            #--destdir{preprocessed_dir} --bpe sentencepiece
+            # TODO include above line back to args and probably add bpe path in original script to tokenize before doing zufuss
             if dict_path is not None:
                 args = f'{args} --srcdict {dict_path}'
             args = remove_multiple_whitespaces(args.replace('\n', ' ')).strip(' ')
@@ -86,6 +88,7 @@ def fairseq_train(
     lr_scheduler='inverse_sqrt',
     criterion='label_smoothed_cross_entropy',
     seed=None,
+        # FIXME: fp16=True, but false for cpu training
     fp16=True,
     **kwargs,
 ):
@@ -109,10 +112,11 @@ def fairseq_train(
         --lr-scheduler {lr_scheduler} --lr {lr} --warmup-updates {warmup_updates} --update-freq {update_freq}
         --arch {arch} --dropout {dropout} --weight-decay 0.0 --clip-norm 0.1 --share-all-embeddings
         --no-epoch-checkpoints --save-interval 999999 --validate-interval 999999
-        --max-update {max_update} --save-interval-updates {save_interval_updates} --keep-interval-updates 1 --patience 10
+        --max-update {max_update} --save-interval-updates {save_interval_updates} --keep-interval-updates 1 --patience 30
         --batch-size {max_sentences} --seed {seed}
-        --distributed-world-size {ngpus} --distributed-port {distributed_port}
+        --distributed-world-size {ngpus} --distributed-port {distributed_port} 
         '''
+        # FIXME: --cpu,  for cpu training
         if lr_scheduler == 'inverse_sqrt':
             args += '--warmup-init-lr 1e-07'
         if fp16:

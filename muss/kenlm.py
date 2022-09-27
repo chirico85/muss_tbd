@@ -9,6 +9,8 @@ from pathlib import Path
 
 import kenlm
 from tokenizers import SentencePieceBPETokenizer
+from tokenizers import ByteLevelBPETokenizer
+from tokenizers import Tokenizer
 
 from muss.utils.helpers import get_temp_filepaths, read_lines, write_lines, log_action, run_command
 
@@ -18,7 +20,7 @@ def train_kenlm_language_model(input_data_paths, output_model_dir):
     output_model_dir.mkdir(exist_ok=True, parents=True)
     output_model_path = output_model_dir / 'kenlm_model.arpa'
     with log_action('Training tokenizer'):
-        tokenizer = SentencePieceBPETokenizer()
+        tokenizer = ByteLevelBPETokenizer()
         tokenizer.train([str(path) for path in input_data_paths], vocab_size=20000)
         tokenizer.save(str(output_model_dir), 'spm_tokenizer')
     with log_action('Tokenizing'):
@@ -39,20 +41,23 @@ def train_kenlm_language_model(input_data_paths, output_model_dir):
 @lru_cache(maxsize=10)
 def get_spm_tokenizer(model_dir):
     assert model_dir.exists(), 'You can download models at https://dl.fbaipublicfiles.com/muss/muss_mining_filtering_kenlm_language_models.tar.gz'
-    merges_file = model_dir / 'spm_tokenizer-merges.txt'
-    vocab_file = model_dir / 'spm_tokenizer-vocab.json'
-    return SentencePieceBPETokenizer(vocab_file=str(vocab_file), merges_file=str(merges_file))
+    # merges_file = model_dir / 'spm_tokenizer-merges.txt'
+    # vocab_file = model_dir / 'spm_tokenizer-vocab.json'
+    # return SentencePieceBPETokenizer(vocab=str(vocab_file), merges=str(merges_file))
+
+    vocab_file = model_dir / 'my-tokenizer.json'
+    return Tokenizer.from_file(str(vocab_file))
 
 
 @lru_cache(maxsize=10)
 def get_kenlm_model(model_dir):
     assert model_dir.exists(), 'You can download models at https://dl.fbaipublicfiles.com/muss/muss_mining_filtering_kenlm_language_models.tar.gz'
-    model_file = model_dir / 'kenlm_model.arpa'
+    model_file = model_dir / 'kenlm_model.klm'
+    # model_file = model_dir / 'kenlm_model.arpa'
     return kenlm.Model(str(model_file))
 
 
 def get_kenlm_log_prob(text, model_dir, *args, **kwargs):
     tokenizer = get_spm_tokenizer(model_dir)
     kenlm_model = get_kenlm_model(model_dir)
-    encoded_text = ' '.join(tokenizer.encode(text).tokens)
-    return kenlm_model.score(encoded_text, *args, **kwargs)
+    return kenlm_model.score(text, *args, **kwargs)

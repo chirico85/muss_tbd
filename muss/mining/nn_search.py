@@ -3,7 +3,8 @@
 #
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
-
+import multiprocessing
+import os
 from collections import defaultdict
 from functools import lru_cache
 from pathlib import Path
@@ -35,6 +36,32 @@ from muss.mining.filtering import (
     filter_candidate_pairs,
     has_hallucinated_named_entities,
 )
+
+import GPUtil
+from threading import Thread
+import time
+from multiprocessing import Pool
+import torch
+
+
+class Monitor(Thread):
+    def __init__(self, delay):
+        super(Monitor, self).__init__()
+        self.gpu_is_available = None
+        self.gpu = None
+        self.stopped = False
+        self.delay = delay  # Time between calls to GPUtil
+        self.start()
+
+    def run(self):
+        while not self.stopped:
+            # GPUtil.showUtilization()
+            time.sleep(self.delay)
+            self.gpu = GPUtil.getGPUs()[0]
+            self.gpu_is_available = torch.cuda.is_available()
+            
+    def stop(self):
+        self.stopped = True
 
 
 def get_cache_dir(dataset_dir):
@@ -84,8 +111,8 @@ def get_results_string_representation(query_sentences_path, db_sentences_paths, 
 
 def get_results_path(query_sentences_path, db_sentences_paths, topk, nprobe, nn_search_results_dir):
     return (
-        nn_search_results_dir
-        / f'{get_results_string_representation(query_sentences_path, db_sentences_paths, topk, nprobe)}.npz'
+            nn_search_results_dir
+            / f'{get_results_string_representation(query_sentences_path, db_sentences_paths, topk, nprobe)}.npz'
     )
 
 
@@ -102,6 +129,12 @@ def compute_and_save_embeddings(sentences_path, base_index_path, get_embeddings,
 
 
 def get_nearest_sentence_ids(query_index, db_index, topk, nprobe, batch_size=1024, use_gpu=True):
+    # TODO: Make GPU RUN AGAIN!!
+    # print('I am in get_nearest_sentence_ids')
+    # import time
+    # print('sleeping started')
+    # time.sleep(8)
+    # print('sleeping finished')
     try:
         faiss.ParameterSpace().set_index_parameter(db_index, 'nprobe', nprobe)
     except RuntimeError as e:
@@ -156,6 +189,46 @@ def compute_and_save_nn(query_sentences_path, db_sentences_paths, topk, nprobe, 
     return results_path
 
 
+def compute_and_save_nn_multiproc(query_sentences_path, db_sentences_paths, topk, nprobe, indexes_dir, nn_search_results_dir):
+    created = multiprocessing.Process()
+    current = multiprocessing.current_process()
+    print('created:', created.name, created._identity)
+    print('running:', current.name, current._identity)
+    print('PID:', os.getpid())
+
+    monitor = Monitor(1)
+    results_path = get_results_path(query_sentences_path, db_sentences_paths, topk, nprobe, nn_search_results_dir)
+    if results_path.exists():
+        return results_path
+    query_index = load_index(get_index_path(query_sentences_path, indexes_dir))
+    db_index = load_indexes([get_index_path(sentences_path, indexes_dir) for sentences_path in db_sentences_paths])
+
+    run_gpu_process = False
+    if run_gpu_process:
+        try:
+            while monitor.gpu.memoryUsed < 400 and monitor.gpu_is_available:
+                print('Started gpu process: ', monitor.gpu.memoryUsed)
+                print('With Process:', created.name, created._identity)
+                print('PID:', os.getpid())
+
+                distances, sentence_ids = get_nearest_sentence_ids(query_index, db_index, topk, nprobe)
+                dump_results(distances, sentence_ids, results_path)
+                # monitor.gpu.memoryUsed = 500
+                monitor.stop()
+                # torch.cuda.empty_cache()
+                del faiss
+                print('GPU cache cleared: ', monitor.gpu.memoryUsed)
+                return results_path
+            else:
+                print('Waiting for resources ', monitor.gpu.memoryUsed)
+                print('With Process:', created.name, created._identity)
+                print('PID:', os.getpid())
+        except Exception as e:
+            print(e)
+    else:
+        return results_path
+
+
 def combine_results_over_db_indexes(intermediary_results_paths, offsets):
     def combine_distances_and_ids(distances_list, sentence_ids_list):
         topk = distances_list[0].shape[1]
@@ -168,7 +241,7 @@ def combine_results_over_db_indexes(intermediary_results_paths, offsets):
         )
 
     for i, (results_path, offset) in tqdm(
-        list(enumerate(zip(intermediary_results_paths, offsets))), desc='Combine db indexes'
+            list(enumerate(zip(intermediary_results_paths, offsets))), desc='Combine db indexes'
     ):
         distances, sentence_ids = load_results(results_path)
         sentence_ids += offset
@@ -182,15 +255,74 @@ def combine_results_over_db_indexes(intermediary_results_paths, offsets):
     return all_distances, all_sentence_ids
 
 
+def compute_and_save_nn_batched_multiproc(
+        query_sentences_path,
+        db_sentences_paths,
+        topk,
+        nprobe,
+        indexes_dir,
+        nn_search_results_dir,
+        n_samples_per_gpu=1e7,
+        delete_intermediary=True,
+):
+    combined_results_path = get_results_path(
+        query_sentences_path, db_sentences_paths, topk, nprobe, nn_search_results_dir
+    )
+    if combined_results_path.exists():
+        return combined_results_path
+    # Batch db paths to fit on one GPU
+    db_sentences_paths_batches = []
+    batch = []
+    n_batch_samples = 0
+    for db_sentences_path in tqdm(db_sentences_paths, desc='Batching db files'):
+        n_samples = cached_count_lines(db_sentences_path)
+        if n_batch_samples + n_samples > n_samples_per_gpu:
+            db_sentences_paths_batches.append(batch)
+            batch = []
+            n_batch_samples = 0
+        batch.append(db_sentences_path)
+        n_batch_samples += n_samples
+    db_sentences_paths_batches.append(batch)
+    intermediary_results_paths = []
+    offset = 0
+    offsets = []
+    pool = multiprocessing.pool.ThreadPool(processes=4)
+
+    for db_sentences_paths_batch in tqdm(db_sentences_paths_batches, desc='Compute NN db batches'):
+        
+        intermediary_results_path = pool.apply_async(compute_and_save_nn_multiproc, args=(query_sentences_path, db_sentences_paths_batch, topk, nprobe, indexes_dir, nn_search_results_dir)).get()
+        print('received path: ', intermediary_results_path)
+        created = multiprocessing.Process()
+        print('from:', created.name, created._identity)
+        intermediary_results_paths.append(intermediary_results_path)
+        offsets.append(offset)
+        offset += sum([cached_count_lines(sentences_path) for sentences_path in db_sentences_paths_batch])
+    pool.close()
+    pool.join()
+    if len(intermediary_results_paths) == 1:
+        assert combined_results_path == intermediary_results_paths[0]
+    else:
+        # Combine and save final result
+        distances, sentence_ids = print_running_time(combine_results_over_db_indexes)(
+            intermediary_results_paths, offsets
+        )
+        dump_results(distances, sentence_ids, combined_results_path)
+        # Delete intermediary results
+        if delete_intermediary:
+            for intermediary_results_path in intermediary_results_paths:
+                intermediary_results_path.unlink()
+    return combined_results_path
+
+
 def compute_and_save_nn_batched(
-    query_sentences_path,
-    db_sentences_paths,
-    topk,
-    nprobe,
-    indexes_dir,
-    nn_search_results_dir,
-    n_samples_per_gpu=1e7,
-    delete_intermediary=True,
+        query_sentences_path,
+        db_sentences_paths,
+        topk,
+        nprobe,
+        indexes_dir,
+        nn_search_results_dir,
+        n_samples_per_gpu=1e7,
+        delete_intermediary=True,
 ):
     combined_results_path = get_results_path(
         query_sentences_path, db_sentences_paths, topk, nprobe, nn_search_results_dir
@@ -244,10 +376,21 @@ def get_candidate_pair_ids(distances, sentence_ids, distance_threshold, density_
     query_sentence_ids = torch.arange(sentence_ids.shape[0]).reshape(-1, 1).repeat(1, sentence_ids.shape[1])
     lower_distance_threshold = 1e-10  # To filter out exact matches
     mask = (
-        (np.abs(distances) > lower_distance_threshold)
-        & (distances < distance_threshold)
-        & (densities < density_threshold)
+            (np.abs(distances) > lower_distance_threshold)
+            & (distances < distance_threshold)
+            & (densities < density_threshold)
     )
+    # count = 0
+    # for i, n in enumerate(densities):
+    #     if any(n < density_threshold):
+    #         count += 1
+    #         print(count, i)
+    # count = 0
+    # for i, n in enumerate(mask):
+    #     if any(n == True):
+    #         count += 1
+    #         print(count, i)
+
     nearest_sentence_ids = torch.masked_select(sentence_ids, mask)
     query_sentence_ids = torch.masked_select(query_sentence_ids, mask)
     # Remove queries that were aligned with a sentence from the same document (we make sure their sentence ids are far enough appart). This prevents overlaps
@@ -302,15 +445,15 @@ def combine_results_over_queries(query_sentences_paths, db_sentences_paths, topk
 
 
 def find_nearest_neighbors(
-    query_sentences_paths,
-    db_sentences_paths,
-    base_index_path,
-    get_embeddings,
-    cache_dir,
-    topk=8,
-    nprobe=16,
-    distance_threshold=0.1,
-    density_threshold=0.8,
+        query_sentences_paths,
+        db_sentences_paths,
+        base_index_path,
+        get_embeddings,
+        cache_dir,
+        topk=8,
+        nprobe=16,
+        distance_threshold=0.1,
+        density_threshold=0.8,
 ):
     query_sentences_paths = list(sorted(query_sentences_paths))
     db_sentences_paths = list(sorted(db_sentences_paths))
@@ -336,7 +479,8 @@ def find_nearest_neighbors(
     query_sentences = get_sentences_from_ids(query_sentence_ids, query_sentences_paths)
     db_sentences = get_sentences_from_ids(db_sentence_ids, db_sentences_paths)
     return list(zip(query_sentences, db_sentences))
-
+    # query_sentences: Original sentence
+    # db_sentences: simple sentence/paraphrase
 
 def get_pairs_path(query_sentences_path, db_sentences_paths, topk, nprobe, filter_kwargs, pairs_dir):
     results_str = get_results_string_representation(query_sentences_path, db_sentences_paths, topk, nprobe)
@@ -344,8 +488,48 @@ def get_pairs_path(query_sentences_path, db_sentences_paths, topk, nprobe, filte
     return pairs_dir / f'pairs_{results_str}_{filter_str}.tsv'
 
 
+def get_best_filters(
+        query_sentences_path, db_sentences_paths, base_index_path, get_embeddings, cache_dir, topk, nprobe,
+        filter_kwargs
+):
+    import numpy as np
+    n_pairs = []
+    n_list = []
+    m_list = []
+    n_distances = np.arange(0, 0.1, 0.01).tolist()
+    n_densities = np.arange(0, 1, 0.1).tolist()
+    for n in n_distances:
+        for m in n_densities:
+            candidate_pairs = print_running_time(find_nearest_neighbors)(
+                [query_sentences_path],
+                db_sentences_paths,
+                base_index_path,
+                get_embeddings,
+                cache_dir,
+                topk=topk,
+                nprobe=nprobe,
+                distance_threshold=n,
+                density_threshold=m,
+            )
+            n_list.append(n)
+            m_list.append(m)
+            n_pairs.append(len(candidate_pairs))
+
+    def extents(f):
+        delta = f[1] - f[0]
+        return [f[0] - delta / 2, f[-1] + delta / 2]
+
+    import matplotlib.pyplot as plt
+    # plt.plot(n_list, m_list, n_pairs,'o')
+    # plt.show()
+
+    plt.scatter(n_list, m_list, n_pairs)
+    plt.show()
+
+
 def get_paraphrase_pairs(
-    query_sentences_path, db_sentences_paths, base_index_path, get_embeddings, cache_dir, topk, nprobe, filter_kwargs
+        query_sentences_path, db_sentences_paths, base_index_path, get_embeddings, cache_dir, topk, nprobe,
+        filter_kwargs
 ):
     candidate_pairs = print_running_time(find_nearest_neighbors)(
         [query_sentences_path],
@@ -357,7 +541,14 @@ def get_paraphrase_pairs(
         nprobe=nprobe,
         distance_threshold=filter_kwargs['distance'],
         density_threshold=filter_kwargs['density'],
+        # distance_threshold=0.8,
+        # density_threshold=0.1,
     )
+    # get_best_filters(
+    #     query_sentences_path, db_sentences_paths, base_index_path, get_embeddings, cache_dir, topk, nprobe,
+    #     filter_kwargs
+    # )
+
     print(f'#candidates: {len(candidate_pairs)}')
     filters = {
         'macro-duplicates': lambda pairs: list(set(candidate_pairs)),
@@ -371,17 +562,17 @@ def get_paraphrase_pairs(
 
 
 def compute_and_save_simplification_pairs(
-    query_sentences_path,
-    db_sentences_paths,
-    base_index_path,
-    get_embeddings,
-    cache_dir,
-    pairs_dir,
-    topk,
-    nprobe,
-    language,
-    filter_kwargs,
-    is_simpler,
+        query_sentences_path,
+        db_sentences_paths,
+        base_index_path,
+        get_embeddings,
+        cache_dir,
+        pairs_dir,
+        topk,
+        nprobe,
+        language,
+        filter_kwargs,
+        is_simpler,
 ):
     simplifications_path = get_pairs_path(
         query_sentences_path, db_sentences_paths, topk, nprobe, filter_kwargs, pairs_dir
@@ -436,18 +627,66 @@ def get_simplification_pairs_paths(query_sentences_paths, db_sentences_paths, to
     return simplification_pairs
 
 
-def combine_simplifications_in_dataset(simplification_pairs, dataset):
-    with create_directory_or_skip(get_dataset_dir(dataset)):
-        assert len(simplification_pairs) > 30000, f'Not enough pairs: {len(simplification_pairs)}'
-        indexes = np.random.permutation(len(simplification_pairs))
-        for phase, start_index, end_index in [
-            ('test', 10000, 20000),
-            ('valid', 20000, 30000),
-            ('train', 30000, len(indexes)),
-        ]:
-            with write_lines_in_parallel(
+def combine_simplifications_in_dataset(simplification_pairs, dataset, max_paragraphs=True):
+    # with create_directory_or_skip(get_dataset_dir(dataset)):
+    print('tes')
+    #TODO: Get more pairs
+    min_size = 30000
+    # assert len(simplification_pairs) > 30000, f'Not enough pairs: {len(simplification_pairs)}'
+    assert len(simplification_pairs) > min_size, f'Not enough pairs: {len(simplification_pairs)}'
+    indexes = np.random.permutation(len(simplification_pairs))
+    if max_paragraphs:
+        len_idx = len(indexes)
+    else:
+        len_idx = 830000
+    for phase, start_index, end_index in [
+        ('test', 10000, 20000),
+        ('valid', 20000, 30000),
+        ('train', 30000, len_idx),
+    ]:
+    # for phase, start_index, end_index in [
+    #     ('test', 50, 100),
+    #     ('valid', 100, 150),
+    #     ('train', 150, len(indexes)),
+    # ]:
+        print(phase, start_index, end_index)
+        with write_lines_in_parallel(
                 [get_data_filepath(dataset, phase, 'complex'), get_data_filepath(dataset, phase, 'simple')]
-            ) as files:
-                for idx in tqdm(indexes[start_index:end_index]):
-                    files.write(simplification_pairs[idx])
+        ) as files:
+            for idx in tqdm(indexes[start_index:end_index]):
+                files.write(simplification_pairs[idx])
+    return get_dataset_dir(dataset)
+
+
+def combine_simplifications_in_dataset_manual(simplification_pairs, dataset):
+    # with create_directory_or_skip(get_dataset_dir(dataset)):
+    print('tes')
+    dataset = f'uts_de_nmt'
+    with open('/home/juliogalindo/PycharmProjects/data_augmentation/backtranslation/data/data_out/preproc.out/out_interactive_para_concat.txt', 'r', encoding='utf8') as fileparaconccat:
+        simplification_pairs = fileparaconccat.readlines()
+    #TODO: Pairs are tab separated in many files (batches), need to know if here lines are tab separated or simple/complex is input as alone
+    min_size = 30000
+    # assert len(simplification_pairs) > 30000, f'Not enough pairs: {len(simplification_pairs)}'
+    assert len(simplification_pairs) > min_size, f'Not enough pairs: {len(simplification_pairs)}'
+    indexes = np.random.permutation(len(simplification_pairs))
+    for phase, start_index, end_index in [
+        ('test', 10000, 20000),
+        ('valid', 20000, 30000),
+        ('train', 30000, len(indexes)),
+    ]:
+    # for phase, start_index, end_index in [
+    #     ('test', 50, 100),
+    #     ('valid', 100, 150),
+    #     ('train', 150, len(indexes)),
+    # ]:
+        print(phase, start_index, end_index)
+        filename1 = f'/mnt/sda/Mitarbeiter/Galindo/muss/muss/ressources/datasets_middle/uts_de_nmt_para/{phase}.complex'
+        filename2 = f'/mnt/sda/Mitarbeiter/Galindo/muss/muss/ressources/datasets_middle/uts_de_nmt_para/{phase}.simple'
+        with open(filename1, 'w', encoding='utf8') as file1:
+            file1.writelines(simplification_pairs)
+        # with write_lines_in_parallel(
+        #         [get_data_filepath(dataset, phase, 'complex'), get_data_filepath(dataset, phase, 'simple')]
+        # ) as files:
+        #     for idx in tqdm(indexes[start_index:end_index]):
+        #         files.write(simplification_pairs[idx])
     return get_dataset_dir(dataset)

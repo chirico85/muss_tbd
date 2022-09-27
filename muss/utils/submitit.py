@@ -43,26 +43,28 @@ def print_job_id(func):
     return wrapped_func
 
 
+            # print_job_id,
+            # print_result,
 @generalized_lru_cache()
 def get_executor(
     cluster='slurm',
-    submit_decorators=[
-        make_function_checkpointable,
-        print_function_name,
-        print_args,
-        print_job_id,
-        print_result,
-        print_running_time,
-    ],
-    timeout_min=1 * 12 * 60,
-    slurm_partition='learnfair',
-    catch=False,
-    gpus_per_node=1,
-    cpus_per_task=None,
-    nodes=1,
-    mem_gb=None,
-    slurm_max_num_timeout=3,
-    **kwargs,
+        submit_decorators=[
+            make_function_checkpointable,
+            print_function_name,
+            print_args,
+            print_running_time,
+            print_result,
+            print_job_id
+        ],
+        timeout_min=1 * 12 * 60,
+        slurm_partition='learnfair',
+        catch=False,
+        gpus_per_node=1,
+        cpus_per_task=None,
+        nodes=1,
+        mem_gb=None,
+        slurm_max_num_timeout=3,
+        **kwargs,
 ):
     assert gpus_per_node <= 8
     executor = AutoExecutor(
@@ -74,12 +76,18 @@ def get_executor(
         cpus_per_task = gpus_per_node * 10
     if mem_gb is None:
         mem_gb = gpus_per_node * 64
+    # executor.update_parameters(
+    #     timeout_min=timeout_min,
+    #     slurm_partition=slurm_partition,
+    #     gpus_per_node=gpus_per_node,
+    #     cpus_per_task=cpus_per_task,
+    #     nodes=nodes,
+    #     mem_gb=mem_gb,
+    #     **kwargs,
+    # )
     executor.update_parameters(
         timeout_min=timeout_min,
-        slurm_partition=slurm_partition,
-        gpus_per_node=gpus_per_node,
         cpus_per_task=cpus_per_task,
-        nodes=nodes,
         mem_gb=mem_gb,
         **kwargs,
     )

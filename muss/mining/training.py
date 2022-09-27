@@ -13,7 +13,7 @@ from easse.utils.constants import TEST_SETS_PATHS
 import torch
 from tqdm import tqdm
 
-from muss.resources.paths import get_data_filepath, MODELS_DIR, get_dataset_dir
+from muss.resources.paths import get_data_filepath, MODELS_DIR, get_dataset_dir, DATASETS_DIR
 from muss.utils.helpers import add_dicts, args_str_to_dict
 from muss.utils.resources import download_and_extract
 from muss.preprocessors import GPT2BPEPreprocessor
@@ -53,21 +53,24 @@ def prepare_mbart_model():
 
 
 def get_access_preprocessors_kwargs(language, use_short_name=False):
+    target_ratio = {'en': 0.8,
+                    'de': 1.2}[language]
     return {
-        'LengthRatioPreprocessor': {'target_ratio': 0.8, 'use_short_name': use_short_name},
-        'ReplaceOnlyLevenshteinPreprocessor': {'target_ratio': 0.8, 'use_short_name': use_short_name},
-        'WordRankRatioPreprocessor': {'target_ratio': 0.8, 'language': language, 'use_short_name': use_short_name},
+        'LengthRatioPreprocessor': {'target_ratio': target_ratio, 'use_short_name': use_short_name},
+        'ReplaceOnlyLevenshteinPreprocessor': {'target_ratio': target_ratio, 'use_short_name': use_short_name},
+        'WordRankRatioPreprocessor': {'target_ratio': target_ratio, 'language': language, 'use_short_name': use_short_name},
         'DependencyTreeDepthRatioPreprocessor': {
-            'target_ratio': 0.8,
+            'target_ratio': target_ratio,
             'language': language,
             'use_short_name': use_short_name,
         },
     }
 
-
+# TODO: Check effect of defining language on training
 def get_predict_files(language):
     return {
         'en': [get_data_filepath('asset', 'valid', 'complex'), get_data_filepath('asset', 'test', 'complex')],
+        'de': [get_data_filepath('TextComplexityDE19', 'valid', 'complex'), get_data_filepath('TextComplexityDE19', 'test', 'complex')],
         'fr': [get_data_filepath('alector', 'valid', 'complex'), get_data_filepath('alector', 'test', 'complex')],
         'es': [
             get_data_filepath('simplext_corpus', 'valid', 'complex'),
@@ -80,6 +83,18 @@ def get_evaluate_kwargs(language, phase='valid'):
     return {
         ('en', 'valid'): {'test_set': 'asset_valid'},
         ('en', 'test'): {'test_set': 'asset_test'},
+        # ('de', 'valid'): {'test_set': 'asset_valid'},
+        # ('de', 'test'): {'test_set': 'asset_test'},
+        ('de', 'valid'): {
+            'test_set': 'custom',
+            'orig_sents_path': get_data_filepath('TextComplexityDE19', 'valid', 'complex'),
+            'refs_sents_paths': [get_data_filepath('TextComplexityDE19', 'valid', 'simple')],
+        },
+        ('de', 'test'): {
+            'test_set': 'custom',
+            'orig_sents_path': get_data_filepath('TextComplexityDE19', 'test', 'complex'),
+            'refs_sents_paths': [get_data_filepath('TextComplexityDE19', 'test', 'simple')],
+        },
         ('fr', 'valid'): {
             'test_set': 'custom',
             'orig_sents_path': get_data_filepath('alector', 'valid', 'complex'),
@@ -244,6 +259,45 @@ def get_mbart_kwargs(dataset, language, use_access, use_short_name=False):
     return kwargs
 
 
+def get_mbart_trimmed_kwargs(dataset, language, use_access, use_short_name=False):
+    mbart_path = DATASETS_DIR / dataset / 'mbart_trimmed' / 'model.pt'
+    source_lang = 'complex'
+    target_lang = 'simple'
+    kwargs = {
+        'dataset': DATASETS_DIR / dataset / 'corpus',
+        'metrics_coefs': [0, 1, 0],
+        'parametrization_budget': 128,
+        'predict_files': get_predict_files(language),
+        'preprocessors_kwargs': {
+            'SentencePiecePreprocessor': {
+                'sentencepiece_model_path': MODELS_DIR / 'muss_de_wiki_mbart' / 'sentence.bpe.model',
+                'tokenize_special_tokens': True,
+            },
+        },
+        'preprocess_kwargs': {
+            'dict_path': DATASETS_DIR / dataset / 'vocab_dict' / 'dict.txt',
+            'source_lang': source_lang,
+            'target_lang': target_lang,
+        },
+        'train_kwargs': add_dicts(
+            {'ngpus': 8},
+            args_str_to_dict(
+                f'''--restore-file {mbart_path}  --arch mbart_large --task translation_from_pretrained_bart  --source-lang {source_lang} --target-lang {target_lang}  --encoder-normalize-before --decoder-normalize-before --criterion label_smoothed_cross_entropy --label-smoothing 0.2  --dataset-impl mmap --optimizer adam --adam-eps 1e-06 --adam-betas '(0.9, 0.98)' --lr-scheduler polynomial_decay --lr 3e-05 --min-lr -1 --warmup-updates 2500 --total-num-update 40000 --dropout 0.3 --attention-dropout 0.1  --weight-decay 0.0 --max-tokens 1024 --update-freq 2 --log-format simple --log-interval 2 --reset-optimizer --reset-meters --reset-dataloader --reset-lr-scheduler --langs ar_AR,cs_CZ,de_DE,en_XX,es_XX,et_EE,fi_FI,fr_XX,gu_IN,hi_IN,it_IT,ja_XX,kk_KZ,ko_KR,lt_LT,lv_LV,my_MM,ne_NP,nl_XX,ro_RO,ru_RU,si_LK,tr_TR,vi_VN,zh_CN
+     --layernorm-embedding  --ddp-backend no_c10d'''
+            ),
+        ),  # noqa: E501
+        'generate_kwargs': args_str_to_dict(
+            f'''--task translation_from_pretrained_bart --source_lang {source_lang} --target-lang {target_lang} --batch-size 32 --langs ar_AR,cs_CZ,de_DE,en_XX,es_XX,et_EE,fi_FI,fr_XX,gu_IN,hi_IN,it_IT,ja_XX,kk_KZ,ko_KR,lt_LT,lv_LV,my_MM,ne_NP,nl_XX,ro_RO,ru_RU,si_LK,tr_TR,vi_VN,zh_CN'''  # noqa: E501
+        ),
+        'evaluate_kwargs': get_evaluate_kwargs(language),
+    }
+    if use_access:
+        kwargs['preprocessors_kwargs'] = add_dicts(
+            get_access_preprocessors_kwargs(language, use_short_name=use_short_name), kwargs['preprocessors_kwargs']
+        )
+    return kwargs
+
+
 def get_all_baseline_rows():
     paths = {
         ('asset', 'test'): ('en', TEST_SETS_PATHS[('asset_test', 'orig')], TEST_SETS_PATHS[('asset_test', 'refs')]),
@@ -267,6 +321,16 @@ def get_all_baseline_rows():
             'fr',
             get_data_filepath('alector', 'valid', 'complex'),
             [get_data_filepath('alector', 'valid', 'simple')],
+        ),
+        ('TextComplexityDE19', 'test'): (
+            'de',
+            get_data_filepath('TextComplexityDE19', 'test', 'complex'),
+            [get_data_filepath('TextComplexityDE19', 'test', 'simple')],
+        ),
+        ('TextComplexityDE19', 'valid'): (
+            'de',
+            get_data_filepath('TextComplexityDE19', 'valid', 'complex'),
+            [get_data_filepath('TextComplexityDE19', 'valid', 'simple')],
         ),
         # Old dataset with problems
         ('simplext_corpus_all', 'test'): (

@@ -90,23 +90,29 @@ def get_predictions(source_path, exp_dir, **kwargs):
 
 def fairseq_evaluate(exp_dir, **kwargs):
     simplifier = fairseq_get_simplifier(exp_dir, **kwargs)
-    evaluate_kwargs = kwargs.get('evaluate_kwargs', {'test_set': 'asset_valid'})
+    # evaluate_kwargs = kwargs.get('evaluate_kwargs', {'test_set': 'asset_valid'})
+    evaluate_kwargs = kwargs.get('evaluate_kwargs', {'test_set': 'custom'})
     return evaluate_simplifier(simplifier, **evaluate_kwargs)
 
 
 def get_easse_report_from_exp_dir(exp_dir, **kwargs):
     simplifier = fairseq_get_simplifier(exp_dir, **kwargs)
-    return get_easse_report(simplifier, **kwargs.get('evaluate_kwargs', {'test_set': 'asset_valid'}))
+    # return get_easse_report(simplifier, **kwargs.get('evaluate_kwargs', {'test_set': 'asset_valid'}))
+    return get_easse_report(simplifier, **kwargs.get('evaluate_kwargs', {'test_set': 'custom'}))
 
 
 def fairseq_evaluate_and_save(exp_dir, **kwargs):
     scores = fairseq_evaluate(exp_dir, **kwargs)
     print(f'scores={scores}')
     report_path = exp_dir / 'easse_report.html'
+    # TODO: Make report work: RuntimeError: BLEU: Each element of `refs` should be a sequence of strings.
     shutil.move(get_easse_report_from_exp_dir(exp_dir, **kwargs), report_path)
     print(f'report_path={report_path}')
+    # predict_files = kwargs.get(
+    #     'predict_files', [get_data_filepath('asset', 'valid', 'complex'), get_data_filepath('asset', 'test', 'complex')]
+    # )
     predict_files = kwargs.get(
-        'predict_files', [get_data_filepath('asset', 'valid', 'complex'), get_data_filepath('asset', 'test', 'complex')]
+        'predict_files', [get_data_filepath('TextComplexityDE19', 'valid', 'complex'), get_data_filepath('TextComplexityDE19', 'test', 'complex')]
     )
     for source_path in predict_files:
         pred_path = get_predictions(source_path, exp_dir, **kwargs)
@@ -125,7 +131,7 @@ def find_best_parametrization_nevergrad(
         simplifier = fairseq_get_simplifier(
             exp_dir, preprocessors_kwargs=preprocessors_kwargs, generate_kwargs=kwargs.get('generate_kwargs', {})
         )
-        scores = evaluate_simplifier(simplifier, **kwargs.get('evaluate_kwargs', {'test_set': 'asset_valid'}))
+        scores = evaluate_simplifier(simplifier, **kwargs.get('evaluate_kwargs', {'test_set': 'custom'}))
         return combine_metrics(scores['bleu'], scores['sari'], scores['fkgl'], metrics_coefs)
 
     def get_parametrization(preprocessors_kwargs):
@@ -152,7 +158,7 @@ def find_best_parametrization_nevergrad(
 def find_best_parametrization_fast(exp_dir, preprocessors_kwargs, **kwargs):
     preprocessors_kwargs = preprocessors_kwargs.copy()  # We are going to modify it inplace
     preprocessors = get_preprocessors(preprocessors_kwargs)
-    orig_sents, refs_sents = get_orig_and_refs_sents(**kwargs.get('evaluate_kwargs', {'test_set': 'asset_valid'}))
+    orig_sents, refs_sents = get_orig_and_refs_sents(**kwargs.get('evaluate_kwargs', {'test_set': 'custom'}))
     features = defaultdict(list)
     for ref_sents in refs_sents:
         for orig_sent, ref_sent in zip(orig_sents, ref_sents):
@@ -180,6 +186,8 @@ def get_language_from_dataset(dataset):
         return 'es'
     if '_it_' in dataset:
         return 'it'
+    if '_de_' in dataset:
+        return 'de'
     else:
         return 'en'
 
@@ -187,9 +195,11 @@ def get_language_from_dataset(dataset):
 def get_datasets_for_language(language):
     # TODO: Should be in ts.uts.training
     return {
-        'en': ['asset', 'turkcorpus_detokenized'],
+        # 'en': ['asset', 'turkcorpus_detokenized'],
+        'en': ['asset'],
         'fr': ['alector'],
         'es': ['simplext_corpus_all_fixed'],
+        'de': ['TextComplexityDE19']
         # 'it': ['simpitiki']
     }[language]
 

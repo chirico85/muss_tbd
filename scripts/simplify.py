@@ -7,8 +7,7 @@
 import argparse
 
 from muss.simplify import ALLOWED_MODEL_NAMES, simplify_sentences
-from muss.utils.helpers import read_lines
-
+from muss.utils.helpers import read_lines, write_lines
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Simplify a file line by line.')
@@ -27,3 +26,8 @@ if __name__ == '__main__':
         print('-' * 80)
         print(f'Original:   {c}')
         print(f'Simplified: {s}')
+
+
+    write_lines(pred_sentences,'scripts/current_prediction.de')
+    from get_scores import calc_metric
+    calc_metric()
